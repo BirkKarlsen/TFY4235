@@ -1,19 +1,21 @@
-using LinearAlgebra, DataStructures, Distributions, Plots, Statistics, DelimitedFiles
-using Distributed, SharedArrays
+using LinearAlgebra, DataStructures, Distributions, Plots
+using ProgressMeter, FLoops, Statistics, DelimitedFiles
 
 # Constants for the project
 
 ξ = 1.0         # restitution coefficient
-N = 1000       # number of particles
+N = 1000        # number of particles
 δt = 1/30       # time-step interval
-T = 4           # time of the simulation
-v0max = 10      # initial max-velocity
+T = 10          # time of the simulation
+v0max = 10/20   # initial max-velocity
 
+rm = 0.01
+rm2 = 0.05
 m = [10 1;]
-r = [0.001 1;]
+r = [rm 1;]
+
 
 # Some useful functions
-
 
 # This function takes in the number of particles in the system, the masses of
 # the particles, the radii of the particles and the maximum allowed initial
@@ -35,16 +37,16 @@ function initialize_particles(N, masses, radii, v0max)
     end
     n = 1
     for i in 1:1:length(radii[:,1])
-        Ψ[n:(n + Int(N * radii[i,2]) - 1),5] .= radii[i,1]
+        Ψ[Int(n):Int(n + Int(N * radii[i,2]) - 1),5] .= radii[i,1]
         n += floor(N * radii[i,2])
     end
     return Ψ
 end
 
-function initialize_two_colliding_particles(masses, radii, v0max)
+function initialize_two_colliding_particles(masses, radii, v0max, b)
     Ψ = Array{Float64, 2}(undef, 2, 7)
     Ψ[1,1:2] = [0.2 0.5]
-    Ψ[2,1:2] = [0.8 0.5]
+    Ψ[2,1:2] = [0.8 0.5+b]
     Ψ[1,3:4] = [v0max 0]
     Ψ[2,3:4] = [-v0max 0]
     Ψ[:,7] = zeros(2)
@@ -56,7 +58,7 @@ function initialize_two_colliding_particles(masses, radii, v0max)
     end
     n = 1
     for i in 1:1:length(radii[:,1])
-        Ψ[n:(n + Int(2 * radii[i,2]) - 1),5] .= radii[i,1]
+        Ψ[Int(n):Int(n + Int(2 * radii[i,2]) - 1),5] .= radii[i,1]
         n += floor(2 * radii[i,2])
     end
     display(Ψ)
@@ -67,45 +69,41 @@ end
 # initialized priority queue and the number of particles. It returns all the
 # initial collisiontimes.
 
-# Must be speed up!
 function initial_collisiontimes(Ψ, pq, N)
     for i in 1:1:N
         Δt_walls, nt = time_to_collision_with_walls(Ψ[i,:])
 
         if Δt_walls[1] != Inf
-            pq[[Δt_walls[1], i, 0, nt, 0, 1]] = Δt_walls[1]
+            pq[[Δt_walls[1], i, 0, nt, 0, 1, 0]] = Δt_walls[1]
         end
         if Δt_walls[2] != Inf
-            pq[[Δt_walls[2], i, 0, nt, 0, 2]] = Δt_walls[2]
+            pq[[Δt_walls[2], i, 0, nt, 0, 2, 0]] = Δt_walls[2]
         end
         for j in (i + 1):1:N
             Δt, nti, ntj = time_to_collision_with_particle(Ψ[i,:], Ψ[j,:])
             if Δt != Inf
-                pq[[Δt, i, j, nti, ntj, 3]] = Δt
+                pq[[Δt, i, j, nti, ntj, 3, 0]] = Δt
             end
         end
     end
     return pq
 end
 
-function initial_collisiontimes_v2(Ψ, pq, N)
-    pqi = SharedArray{Float64, 3}(N, N + 1, 6)
-    @time @distributed for i in 1:1:N
+# The same function but using FLoops
+function initial_collisiontimes_parallel(Ψ, pq, N, ncores)
+    @floop ThreadedEx(basesize=N+ncores) for i in 1:1:N
         Δt_walls, nt = time_to_collision_with_walls(Ψ[i,:])
 
-        pqi[i,1,:] = [Δt_walls[1], i, 0, nt, 0, 1]
-        pqi[i,2,:] = [Δt_walls[2], i, 0, nt, 0, 2]
-
-        @distributed for j in (i + 1):1:N
-            Δt, nti, ntj = time_to_collision_with_particle(Ψ[i,:], Ψ[j,:])
-
-            pqi[i,j,:] = [Δt, i, j, nti, ntj, 3]
+        if Δt_walls[1] != Inf
+            pq[[Δt_walls[1], i, 0, nt, 0, 1, 0]] = Δt_walls[1]
         end
-    end
-    for i in 1:1:N
-        for j in 1:1:(N+1)
-            if pqi[i,j,1] != Inf && pqi[i,j,2] == i
-                pq[pqi[i,j,:]] = pqi[i,j,1]
+        if Δt_walls[2] != Inf
+            pq[[Δt_walls[2], i, 0, nt, 0, 2, 0]] = Δt_walls[2]
+        end
+        for j in (i + 1):1:N
+            Δt, nti, ntj = time_to_collision_with_particle(Ψ[i,:], Ψ[j,:])
+            if Δt != Inf
+                pq[[Δt, i, j, nti, ntj, 3, 0]] = Δt
             end
         end
     end
@@ -141,8 +139,8 @@ end
 # this collision was listed. Returns a new array with updated particle
 # information.
 function collision_with_wall(Ψᵢ, ξ, vh, nt)
-    if nt != Ψᵢ[7]
-        return Ψᵢ
+    if Int(nt) != Int(Ψᵢ[7])
+        return Ψᵢ, false
     else
         if vh == 1
             Ψᵢ[3:4] = [- ξ * Ψᵢ[3], ξ * Ψᵢ[4]]
@@ -151,7 +149,7 @@ function collision_with_wall(Ψᵢ, ξ, vh, nt)
         end
         Ψᵢ[7] += 1
 
-        return Ψᵢ
+        return Ψᵢ, true
     end
 end
 
@@ -167,7 +165,7 @@ function time_to_collision_with_particle(Ψᵢ, Ψⱼ)
 
     Δt = 0
 
-    if Δv ⋅ Δx >= 0 || d <= 0 || Rij > Δx ⋅ Δx
+    if Δv ⋅ Δx >= 0 || d <= 0 || Rij > √(Δx ⋅ Δx)
         Δt = Inf
     else
         Δt = - (Δv ⋅ Δx + √(d)) / (Δv ⋅ Δv)
@@ -182,8 +180,8 @@ end
 # listed and the number of the collision of the collisions the two particles
 # had when the collision was listed.
 function collision_with_particle(Ψᵢ, Ψⱼ, ξ, nti, ntj)
-    if Ψᵢ[7] != nti || Ψⱼ[7] != ntj
-        return Ψᵢ, Ψⱼ
+    if Int(Ψᵢ[7]) != Int(nti) || Int(Ψⱼ[7]) != Int(ntj)
+        return Ψᵢ, Ψⱼ, false
     else
         Δx = Ψⱼ[1:2] .- Ψᵢ[1:2]
         Δv = Ψⱼ[3:4] .- Ψᵢ[3:4]
@@ -195,7 +193,7 @@ function collision_with_particle(Ψᵢ, Ψⱼ, ξ, nti, ntj)
         Ψᵢ[7] += 1
         Ψⱼ[7] += 1
 
-        return Ψᵢ, Ψⱼ
+        return Ψᵢ, Ψⱼ, true
     end
 end
 
@@ -240,48 +238,40 @@ function new_times_to_collision(Ψ, event, pq)
     return pq
 end
 
-
-function new_times_to_collision_v2(Ψ, event, pq)
+# Same as last function but using FLoops
+function new_times_to_collision_parallel(Ψ, event, pq, c, ncores)
     if event[6] != 3
         Δt_walls, nt = time_to_collision_with_walls(Ψ[Int(event[2]),:])
         if Δt_walls[1] != Inf
-            pq[[event[1] + Δt_walls[1], Int(event[2]), 0, nt, 0, 1]] = event[1] + Δt_walls[1]
+            pq[[event[1] + Δt_walls[1], Int(event[2]), 0, nt, 0, 1, c]] = event[1] + Δt_walls[1]
         end
         if Δt_walls[2] != Inf
-            pq[[event[1] + Δt_walls[2], Int(event[2]), 0, nt, 0, 2]] = event[1] + Δt_walls[2]
+            pq[[event[1] + Δt_walls[2], Int(event[2]), 0, nt, 0, 2, c]] = event[1] + Δt_walls[2]
         end
-        pqi = SharedArray{Float64, 2}(N, 6)
-        @distributed for j in 1:1:N
+        @floop ThreadedEx(basesize = N + ncores) for j in 1:1:N
             if j != Int(event[2])
                 Δt, nti, ntj = time_to_collision_with_particle(Ψ[Int(event[2]),:], Ψ[j,:])
-                pqi[j,:] = [event[1] + Δt, Int(event[2]), j, nti, ntj, 3]
-            end
-        end
-        for j in 1:1:N
-            if pqi[j,1] != Inf && Int(event[2]) != j && pqi[j,2] != 0
-                pq[pqi[j,:]] = pqi[j,1]
+                if Δt != Inf
+                    pq[[event[1] + Δt, Int(event[2]), j, nti, ntj, 3, c]] = event[1] + Δt
+                end
             end
         end
     else
         for i in 1:1:2
             Δt_walls, nt = time_to_collision_with_walls(Ψ[Int(event[1 + i]),:])
             if Δt_walls[1] != Inf
-                pq[[event[1] + Δt_walls[1], Int(event[1 + i]), 0, nt, 0, 1]] = event[1] + Δt_walls[1]
+                pq[[event[1] + Δt_walls[1], Int(event[1 + i]), 0, nt, 0, 1, c]] = event[1] + Δt_walls[1]
             end
             if Δt_walls[2] != Inf
-                pq[[event[1] + Δt_walls[2], Int(event[1 + i]), 0, nt, 0, 2]] = event[1] + Δt_walls[2]
+                pq[[event[1] + Δt_walls[2], Int(event[1 + i]), 0, nt, 0, 2, c]] = event[1] + Δt_walls[2]
             end
-            pqi = SharedArray{Float64, 2}(N, 6)
-            @distributed for j in 1:1:N
+            @floop ThreadedEx(basesize = N + ncores) for j in 1:1:N
                 if j != Int(event[1 + i])
                     Δt, nti, ntj = time_to_collision_with_particle(Ψ[Int(event[1 + i]),:], Ψ[j,:])
-                    pqi[j,:] = [event[1] + Δt, Int(event[1 + i]), j, nti, ntj, 3]
+                    if Δt != Inf
+                        pq[[event[1] + Δt, Int(event[1 + i]), j, nti, ntj, 3, c]] = event[1] + Δt
+                    end
                 end
-            end
-        end
-        for j in 1:1:N
-            if pqi[j,1] != Inf && Int(event[2]) != j && pqi[j,2] != 0
-                pq[pqi[j,:]] = pqi[j,1]
             end
         end
     end
@@ -289,9 +279,27 @@ function new_times_to_collision_v2(Ψ, event, pq)
 end
 
 
+# This function animates a set of particle tracks modelling a homogeneous gas.
+function animate_homogeneous_gas(particle_tracks, rm)
+    particle_x = particle_track[:,1:2:end]
+    particle_y = particle_track[:,2:2:end]
+
+    n = Int(length(particle_track[1,:]) / 2)
+
+    gr()
+    anim = @animate for i ∈ 1:n
+        plot(particle_x[1:end,i], particle_y[1:end,i], seriestype= :scatter,
+         xlims=(0,1), ylims=(0,1), legend = false,
+         markersize=rm*550*1.101, size=(600, 600))
+    end
+
+    gif(anim, "Scatterplotp.gif", fps=30)
+end
+
 
 function main(N, ξ, masses, radii, v0max, T, δt)
     Ψ = initialize_particles(N, masses, radii, v0max)
+    Ψ = initialize_two_colliding_particles(masses, radii, v0max)
     particle_tracks = Array{Float64, 2}(undef, N, 2)
     particle_tracks[:,1:2] .= Ψ[:,1:2]
     velocities = Array{Float64, 1}(undef, N)
@@ -338,18 +346,72 @@ function main(N, ξ, masses, radii, v0max, T, δt)
     return particle_tracks, velocities
 end
 
-
-function problem_1(N, ξ, masses, radii, v0max, it)
+function mainp(N, ξ, masses, radii, v0max, T, δt, ncores)
     Ψ = initialize_particles(N, masses, radii, v0max)
-    #velocities = Array{Float64, 2}(undef, N, it + 1)
-    #velocities[:,1] = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
-    #times = Array{Float64, 1}(undef, it + 1)
-    #times[1] = 0
+    #Ψ = initialize_two_colliding_particles(masses, radii, v0max, 0)
+    particle_tracks = Array{Float64, 2}(undef, N, 2)
+    particle_tracks[:,1:2] .= Ψ[:,1:2]
+    velocities = Array{Float64, 1}(undef, N)
+    velocities[:] = Ψ[:,3].^2 .+ Ψ[:,4].^2
 
     t = 0
-    k = 1
 
-    velocities = Array{Float64, 2}(undef, N, 4)
+    pq = PriorityQueue{Array{Float64, 1}, Float64}()
+    pq = initial_collisiontimes_parallel(Ψ, pq, N, ncores)
+
+    # Array t, i, j, nti, ntj, wp (vertical = 1, horisontal = 2, particle = 3), c
+    event = dequeue!(pq)
+    coll = 0
+    ϵ = 0
+    while t < T
+        tt = t
+        while t + δt > event[1] && t < event[1]
+            Δt = event[1] - tt
+            Ψ[:,1:2] = Ψ[:,1:2] .+ Ψ[:,3:4] * Δt
+
+            if event[6] == 1 || event[6] == 2
+                Ψ[Int(event[2]),:], happen = collision_with_wall(Ψ[Int(event[2]),:], ξ, event[6], event[4])
+                if happen
+                    coll += 1
+                    pq = new_times_to_collision_parallel(Ψ, event, pq, coll, ncores)
+                end
+            else
+                Ψᵢ = Ψ[Int(event[2]),:]
+                Ψⱼ = Ψ[Int(event[3]),:]
+                Ψᵢ, Ψⱼ, happen = collision_with_particle(Ψᵢ, Ψⱼ, ξ, event[4], event[5])
+                Ψ[Int(event[2]),:] = Ψᵢ
+                Ψ[Int(event[3]),:] = Ψⱼ
+                if happen
+                    coll += 1
+                    pq = new_times_to_collision_parallel(Ψ, event, pq, coll, ncores)
+                end
+            end
+
+            tt = event[1]
+            if isempty(pq)
+                break
+            end
+            event = dequeue!(pq)
+        end
+        Ψ[:,1:2] = Ψ[:,1:2] .+ Ψ[:,3:4] * (t + δt - tt)
+        particle_tracks = hcat(particle_tracks, Ψ[:,1:2])
+        velocities = hcat(velocities, Ψ[:,3].^2 .+ Ψ[:,4].^2)
+        t += δt
+        ϵ += 1
+    end
+    display("returned")
+    return particle_tracks, velocities
+end
+
+
+
+# These functions are to solve Problem 1
+function problem_1(N, ξ, masses, radii, v0max, it)
+    Ψ = initialize_particles(N, masses, radii, v0max)
+
+    t = 0
+
+    velocities = Array{Float64, 1}(undef, N)
 
     pq = PriorityQueue{Array{Float64, 1}, Float64}()
     pq = initial_collisiontimes(Ψ, pq, N)
@@ -358,76 +420,99 @@ function problem_1(N, ξ, masses, radii, v0max, it)
     coll_count = 0
     collww = 0
     collwp = 0
-    display("Running...")
 
-    for i in 2:(it + 1)
+    @showprogress 1 "Computing..." for i in 2:(it + 1)
         Δt = event[1] - t
         Ψ[:,1:2] = Ψ[:,1:2] .+ Ψ[:,3:4] * Δt
 
         if event[6] == 1 || event[6] == 2
             collww += 1
-            Ψ[Int(event[2]),:] = collision_with_wall(Ψ[Int(event[2]),:], ξ, event[6], event[4])
-            pq = new_times_to_collision(Ψ, event, pq)
+            Ψ[Int(event[2]),:], happen = collision_with_wall(Ψ[Int(event[2]),:], ξ, event[6], event[4])
+            if happen
+                pq = new_times_to_collision(Ψ, event, pq)
+            end
         else
             collwp += 1
             Ψᵢ = Ψ[Int(event[2]),:]
             Ψⱼ = Ψ[Int(event[3]),:]
-            Ψᵢ, Ψⱼ = collision_with_particle(Ψᵢ, Ψⱼ, ξ, event[4], event[5])
+            Ψᵢ, Ψⱼ, happen = collision_with_particle(Ψᵢ, Ψⱼ, ξ, event[4], event[5])
             Ψ[Int(event[2]),:] = Ψᵢ
             Ψ[Int(event[3]),:] = Ψⱼ
-            pq = new_times_to_collision(Ψ, event, pq)
+            if happen
+                pq = new_times_to_collision(Ψ, event, pq)
+            end
         end
-        #velocities[:,i] = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
-        #times[i] = t
 
         t = event[1]
         event = dequeue!(pq)
         coll_count += 1
-
-        if coll_count == 700000 || coll_count == 800000 || coll_count == 900000
-            velocities[:,k] = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
-            k += 1
-        end
-
-        if coll_count % (it//500) == 0
-            display(coll_count * 100 / it)
-        end
     end
     display("Returned")
     display(collww)
     display(collwp)
 
-    velocities[:,k] = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
-
+    velocities = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
     return velocities
 end
 
-@time problem_1(N, ξ, m, r, v0max, 1000)
 
+function problem_1p(N, ξ, masses, radii, v0max, it, ncores)
+    Ψ = initialize_particles(N, masses, radii, v0max)
 
-#vel = problem_1(N, ξ, m, r, v0max, 1000000)
+    t = 0
 
-#writedlm("velocities15.csv", vel, ',')
+    velocities = Array{Float64, 1}(undef, N)
 
-#vel = problem_1(N, ξ, m, r, v0max, 1000000)
+    pq = PriorityQueue{Array{Float64, 1}, Float64}()
+    pq = initial_collisiontimes_parallel(Ψ, pq, N, ncores)
 
-#writedlm("velocities16.csv", vel, ',')
+    event = dequeue!(pq)
+    coll_count = 0
+    collww = 0
+    collwp = 0
 
-#vel = problem_1(N, ξ, m, r, v0max, 1000000)
+    @showprogress 1 "Computing..." for i in 2:(it + 1)
+        Δt = event[1] - t
+        Ψ[:,1:2] = Ψ[:,1:2] .+ Ψ[:,3:4] * Δt
 
-#writedlm("velocities17.csv", vel, ',')
+        if event[6] == 1 || event[6] == 2
+            collww += 1
+            Ψ[Int(event[2]),:], happen = collision_with_wall(Ψ[Int(event[2]),:], ξ, event[6], event[4])
+            if happen
+                pq = new_times_to_collision_parallel(Ψ, event, pq, ncores)
+            end
+        else
+            collwp += 1
+            Ψᵢ = Ψ[Int(event[2]),:]
+            Ψⱼ = Ψ[Int(event[3]),:]
+            Ψᵢ, Ψⱼ, happen = collision_with_particle(Ψᵢ, Ψⱼ, ξ, event[4], event[5])
+            Ψ[Int(event[2]),:] = Ψᵢ
+            Ψ[Int(event[3]),:] = Ψⱼ
+            if happen
+                pq = new_times_to_collision_parallel(Ψ, event, pq, ncores)
+            end
+        end
 
-#vel = problem_1(N, ξ, m, r, v0max, 1000000)
+        t = event[1]
+        event = dequeue!(pq)
+        coll_count += 1
+    end
+    display("Returned")
+    display(collww)
+    display(collwp)
 
-#writedlm("velocities18.csv", vel, ',')
+    velocities = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
+    return velocities
+end
 
-#vel = problem_1(N, ξ, m, r, v0max, 1000000)
-
-#writedlm("velocities19.csv", vel, ',')
-
-#vel = problem_1(N, ξ, m, r, v0max, 1000000)
-
-#writedlm("velocities20.csv", vel, ',')
+function generate_statistics(it, n, ncores)
+    for i ∈ 1:1:n
+        vel = problem_1p(N, ξ, m, r, v0max, it, ncores)
+        filename = "velocities_parallel" * string(i) * ".csv"
+        writedlm(filename, vel, ',')
+        display(filename)
+    end
+end
 
 
 #velsq = vel.^2
@@ -436,16 +521,4 @@ end
 
 #writedlm("times.csv", ti, ',')
 
-
-#particle_x = particle_track[:,1:2:end]
-#particle_y = particle_track[:,2:2:end]
-
-#n = Int(length(particle_track[1,:]) / 2)
-
-#gr()
-#anim = @animate for i ∈ 1:n
-#    plot(particle_x[:,i], particle_y[:,i], seriestype= :scatter,
-#     title = "Scatter plot", xlims=(0,1), ylims=(0,1), legend = false)
-#end
-
-#gif(anim, "Scatterplot.gif", fps=30)
+#particle_track, velocities = mainp(N, ξ, m, r, v0max, T, δt, ncores)
