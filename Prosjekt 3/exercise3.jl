@@ -47,9 +47,8 @@ function initialize_R(α, Γ, K, Kᴬ)
 end
 
 # This function iterates forward in time using the Crank-Nicolson Method.
-function time_iteration(L, R, Cⁱ, S, i)
+function time_iteration(F, R, Cⁱ, S, i)
     V = R * Cⁱ .+ (1/2) .*(S[:,i] .+ S[:,i + 1])
-    F = lu(L)
     return F \ V
 end
 
@@ -110,9 +109,11 @@ function solver(K_func, kw, C₀, St, Δt, Δz, l, τ)
 
     L = initialize_L(α, Γ, K, Kᴬ)
     R = initialize_R(α, Γ, K, Kᴬ)
+    S = 2 .* Γ .* S
+    F = lu(L)
 
     @showprogress 1 "Computing..." for i in 1:1:(Nt-1)
-        C[:,i + 1] = time_iteration(L, R, C[:,i], S, i)
+        C[:,i + 1] = time_iteration(F, R, C[:,i], S, i)
     end
     return C, t, z, K
 end
@@ -152,4 +153,4 @@ end
 # Running tht code
 St = zeros(Int(trunc(τ / Δt)))
 
-C, t, z, K = solver(K2, 0, C02, St, Δt, Δz, l, τ)
+C, t, z, K = solver(K₂, 0, C02, St, Δt, Δz, l, τ)
