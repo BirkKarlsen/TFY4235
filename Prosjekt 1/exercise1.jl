@@ -1,5 +1,6 @@
 using LinearAlgebra, DataStructures, Distributions, Plots
 using ProgressMeter, FLoops, Statistics, DelimitedFiles
+using LaTeXStrings
 
 # Constants for the project
 
@@ -20,7 +21,7 @@ r = [rm 1;]
 
 # This function takes in the number of particles in the system, the masses of
 # the particles, the radii of the particles and the maximum allowed initial
-# velocity of the particles. Returns a Nx7 array for all the particles in the
+# velocity of the particles. Returns a Nx8 array for all the particles in the
 # system.
 function initialize_particles(N, masses, radii, v0max)
     Ψ = Array{Float64, 2}(undef, N, 8)
@@ -82,12 +83,13 @@ function initialize_particles_improved(N, masses, radii, v0max)
 end
 
 function initialize_two_colliding_particles(masses, radii, v0max, b)
-    Ψ = Array{Float64, 2}(undef, 2, 7)
+    Ψ = Array{Float64, 2}(undef, 2, 8)
     Ψ[1,1:2] = [0.2 0.5]
     Ψ[2,1:2] = [0.8 0.5+b]
-    Ψ[1,3:4] = [v0max 0]
+    Ψ[1,3:4] = [0 0]
     Ψ[2,3:4] = [-v0max 0]
     Ψ[:,7] = zeros(2)
+    Ψ[:,8] = zeros(2)
 
     n = 1
     for i in 1:1:(length(masses[:,1]))
@@ -99,8 +101,35 @@ function initialize_two_colliding_particles(masses, radii, v0max, b)
         Ψ[Int(n):Int(n + Int(2 * radii[i,2]) - 1),5] .= radii[i,1]
         n += floor(2 * radii[i,2])
     end
-    display(Ψ)
     return Ψ
+end
+
+function initialize_projectile_and_wall(N, r, m, v0, kr, km)
+    Ψ = Array{Float64, 2}(undef, N, 8)
+    # Initialize projectile
+    Ψ[1,1:2] = [0.5 0.75]
+    Ψ[1,3:4] = [0 -v0]
+    Ψ[1,5] = kr * r
+    Ψ[1,6] = km * m
+    Ψ[1,7:8] = [0 0]
+
+    # Initialize the wall
+    Ψ[2:end,3:4] .= [0 0]
+    Ψ[2:end, 5] .= r
+    Ψ[2:end, 6] .= m
+    Ψ[2:end, 7:8] .= [0 0]
+    @showprogress 1 "Initializing particles..." for i ∈ 2:1:N
+        val = 1
+        while val != 0
+            Ψ[i,1] = rand(Uniform(Ψ[i,5], 1 - Ψ[i,5]))
+            Ψ[i,2] = rand(Uniform(Ψ[i,5], 0.5 - Ψ[i,5]))
+            val = 0
+            for j ∈ 1:1:(i-1)
+                val += check_overlap(Ψ[i,:], Ψ[j,:])
+            end
+        end
+    end
+    Ψ
 end
 
 # This function checks whether the two particles overlap. Returns 0 if the
@@ -250,6 +279,7 @@ end
 
 # This function must be speed up!
 function new_times_to_collision(Ψ, event, pq, c)
+    N = length(Ψ[:,1])
     if event[6] != 3
         Δt_walls, nt = time_to_collision_with_walls(Ψ[Int(event[2]),:])
         if Δt_walls[1] != Inf
@@ -290,6 +320,7 @@ end
 
 # Same as last function but using FLoops
 function new_times_to_collision_parallel(Ψ, event, pq, c, ncores)
+    N = length(Ψ[:,1])
     if event[6] != 3
         Δt_walls, nt = time_to_collision_with_walls(Ψ[Int(event[2]),:])
         if Δt_walls[1] != Inf
@@ -379,6 +410,37 @@ function perform_event_parallel(Ψ, event, pq, c, ξ, ncores)
     return Ψ, pq, c
 end
 
+function perform_event_parallel_with_tc(Ψ, event, pq, c, cpp, ξ, ncores, tc)
+    if event[6] == 1 || event[6] == 2
+        if event[1] - Ψ[Int(event[2]), 8] < tc
+            ξ = 1.0
+        end
+        Ψ[Int(event[2]),:], happen = collision_with_wall(Ψ[Int(event[2]),:], ξ, event[6], event[4])
+        if happen
+            c += 1
+            pq = new_times_to_collision_parallel(Ψ, event, pq, c, ncores)
+            Ψ[Int(event[2]),8] = event[1]
+        end
+    else
+        Ψᵢ = Ψ[Int(event[2]),:]
+        Ψⱼ = Ψ[Int(event[3]),:]
+        if event[1] - Ψᵢ[8] < tc || event[1] - Ψⱼ[8] < tc
+            ξ = 1.0
+        end
+        Ψᵢ, Ψⱼ, happen = collision_with_particle(Ψᵢ, Ψⱼ, ξ, event[4], event[5])
+        Ψ[Int(event[2]),:] = Ψᵢ
+        Ψ[Int(event[3]),:] = Ψⱼ
+        if happen
+            c += 1
+            cpp += 1
+            pq = new_times_to_collision_parallel(Ψ, event, pq, c, ncores)
+            Ψ[Int(event[2]),8] = event[1]
+            Ψ[Int(event[3]),8] = event[1]
+        end
+    end
+    return Ψ, pq, c, cpp
+end
+
 # This function animates a set of particle tracks modelling a homogeneous gas.
 function animate_homogeneous_gas(particle_tracks, rm)
     particle_x = particle_tracks[:,1:2:end]
@@ -396,7 +458,20 @@ function animate_homogeneous_gas(particle_tracks, rm)
     gif(anim, "Scatterplotp.gif", fps=30)
 end
 
+# This function counts the amount of particles that have been affected
+function affected_amount(Ψ₀, Ψ₁, tol)
+    ap = 0
+    for i ∈ 2:Int(length(Ψ₀[:,1]))
+        Δx = vec(Ψ₀[i,1:2] .- Ψ₁[i,1:2])
+        if sqrt(Δx ⋅ Δx) > tol
+            ap += 1
+        end
+    end
+    return ap
+end
 
+# These functions simulate with a recording of the particles position for a
+# constant timestep. These functions are ideal for animation of the system.
 function main(N, ξ, masses, radii, v0max, T, δt)
     Ψ = initialize_particles(N, masses, radii, v0max)
     Ψ = initialize_two_colliding_particles(masses, radii, v0max)
@@ -497,13 +572,47 @@ function mainp(N, ξ, masses, radii, v0max, T, δt, ncores)
 end
 
 
+# This function is to solve test B4
+function test_B4(N, ncores)
+    r₁ = 0.1
+    m₁ = 1e6
+    r₂ = 0.001
+    m₂ = 1
+    masses = [m₁ 0.5; m₂ 0.5]
+    radii = [r₁ 0.5; r₂ 0.5]
+
+    bs = LinRange(0, r₁ + r₂, N)
+    θ = Array{Float64, 1}(undef, N)
+
+    for i in 1:1:N
+        Ψ = initialize_two_colliding_particles(masses, radii, 5, bs[i])
+        vᵢ = Array{Float64, 2}(undef, 2, 2)
+        vᵢ[1,:] = Ψ[2,3:4]
+
+        pq = PriorityQueue{Array{Float64, 1}, Float64}()
+        pq = initial_collisiontimes_parallel(Ψ, pq, 2, ncores)
+
+        event = dequeue!(pq)
+        coll_count = 0
+        Ψ[:,1:2] = Ψ[:,1:2] .+ Ψ[:,3:4] * event[1]
+
+        Ψ, pq, coll_count = perform_event_parallel(Ψ, event, pq, coll_count, 1, ncores)
+
+        vᵢ[2,:] = Ψ[2,3:4]
+
+        θ[i] = acos((vᵢ[1,:] ⋅ vᵢ[2,:])/(sqrt(vᵢ[1,:] ⋅ vᵢ[1,:]) * sqrt(vᵢ[2,:] ⋅ vᵢ[2,:])))
+    end
+    return (bs ./ (r₁ + r₂)), θ
+end
+
 # These functions are to solve Problem 1
 function problem_1(N, ξ, masses, radii, v0max, it)
     Ψ = initialize_particles(N, masses, radii, v0max)
 
     t = 0
 
-    velocities = Array{Float64, 1}(undef, N)
+    velocities_i = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
+    velocities_f = Array{Float64, 1}(undef, N)
 
     pq = PriorityQueue{Array{Float64, 1}, Float64}()
     pq = initial_collisiontimes(Ψ, pq, N)
@@ -515,15 +624,15 @@ function problem_1(N, ξ, masses, radii, v0max, it)
         Δt = event[1] - t
         Ψ[:,1:2] = Ψ[:,1:2] .+ Ψ[:,3:4] * Δt
 
-        Ψ, pq, c = perform_event(Ψ, event, pq, coll_count, ξ)
+        Ψ, pq, coll_count = perform_event(Ψ, event, pq, coll_count, ξ)
 
         t = event[1]
         event = dequeue!(pq)
     end
     display("Returned")
 
-    velocities = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
-    return velocities
+    velocities_f = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
+    return velocities_i, velocities_f
 end
 
 function problem_1p(N, ξ, masses, radii, v0max, it, ncores)
@@ -531,7 +640,8 @@ function problem_1p(N, ξ, masses, radii, v0max, it, ncores)
 
     t = 0
 
-    velocities = Array{Float64, 1}(undef, N)
+    velocities_i = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
+    velocities_f = Array{Float64, 1}(undef, N)
 
     pq = PriorityQueue{Array{Float64, 1}, Float64}()
     pq = initial_collisiontimes_parallel(Ψ, pq, N, ncores)
@@ -550,8 +660,8 @@ function problem_1p(N, ξ, masses, radii, v0max, it, ncores)
     end
     display("Returned")
 
-    velocities = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
-    return velocities
+    velocities_f = sqrt.(Ψ[:,3].^2 .+ Ψ[:,4].^2)
+    return velocities_i, velocities_f
 end
 
 
@@ -619,9 +729,10 @@ function problem_2p(N, ξ, m, r, v0max, it, ncores)
 end
 
 
-# This is the function to solve problem 3 in the exercise
+# This is the function to solve problem 3 in the exercise. Run code at 300000
+# iterations with ξ at 1, 0.9 and 0.8. No need for TC actually.
 
-function problem_3p(N, ξ, m, r, v0max, it, ncores, tc)
+function problem_3p(N, ξ, m, r, v0max, it, ncores, tc, eng_maxcpp = false, maxcpp = 0)
     masses = [m 0.5; 4*m 0.5]
     radii = [r 1;]
     Ψ = initialize_particles_improved(N, masses, radii, v0max)
@@ -635,26 +746,127 @@ function problem_3p(N, ξ, m, r, v0max, it, ncores, tc)
     avg_K_tot = Array{Float64, 1}(undef, it)
     avg_K_1[1] = (1/2) * masses[1,1] * mean(Ψ[1:Int(trunc(N/2)),3].^2 .+ Ψ[1:Int(trunc(N/2)),4].^2)
     avg_K_2[1] = (1/2) * masses[2,1] * mean(Ψ[Int(trunc(N/2))+1:end,3].^2 .+ Ψ[Int(trunc(N/2))+1:end,4].^2)
-    avg_K_tot[1] = (avg_K_1[1] + avg_K_2[1]) / N
+    avg_K_tot[1] = (avg_K_1[1] + avg_K_2[1]) / 2
 
     pq = PriorityQueue{Array{Float64, 1}, Float64}()
     pq = initial_collisiontimes_parallel(Ψ, pq, N, ncores)
 
     event = dequeue!(pq)
     coll = 0
-    it_stop
+    collpp = 0
+    it_stop = 0
 
-    @showprogress 1 "Computing..." for i ∈ 1:1:it
+    @showprogress 1 "Computing..." for i ∈ 2:it
+        Δt = event[1] - t
+        Ψ[:,1:2] = Ψ[:,1:2] .+ Ψ[:,3:4] * Δt
+        Ψ, pq, coll, collpp = perform_event_parallel_with_tc(Ψ, event, pq, coll, collpp, ξ, ncores, tc)
+
+        avg_K_1[i] = (1/2) * masses[1,1] * mean(Ψ[1:Int(trunc(N/2)),3].^2 .+ Ψ[1:Int(trunc(N/2)),4].^2)
+        avg_K_2[i] = (1/2) * masses[2,1] * mean(Ψ[Int(trunc(N/2))+1:end,3].^2 .+ Ψ[Int(trunc(N/2))+1:end,4].^2)
+        avg_K_tot[i] = (avg_K_1[i] + avg_K_2[i]) / 2
+
+        times[i] = event[1]
+        t = event[1]
+        event = dequeue!(pq)
+
+        if collpp / N > maxcpp && eng_maxcpp
+            it_stop = i
+            break
+        end
+    end
+    display("Returned")
+    return avg_K_1, avg_K_2, avg_K_tot, times, it_stop
+end
+
+
+# This function solves problem 4.
+
+function problem_4p(N, ξ, r, m, v0, kr, km, tol, tc, it, ncores)
+    Ψ = initialize_projectile_and_wall(N, r, m, v0, kr, km)
+    E = Array{Float64, 1}(undef, it)
+    E[1] = (1/2) * km * m * v0^2
+    Ψ₀ = copy(Ψ)
+    pac = (N - 1) * π * r^2 / (0.5 * 1)
+
+    t = 0
+
+    pq = PriorityQueue{Array{Float64, 1}, Float64}()
+    pq = initial_collisiontimes_parallel(Ψ, pq, N, ncores)
+
+    event = dequeue!(pq)
+    coll = 0
+    collpp = 0
+    it_stop = 0
+
+    @showprogress 1 "Computing..." for i ∈ 2:it
         Δt = event[1] - t
         Ψ[:,1:2] = Ψ[:,1:2] .+ Ψ[:,3:4] * Δt
 
-        
+        Ψ, pq, coll, collpp = perform_event_parallel_with_tc(Ψ, event, pq, coll, collpp, ξ, ncores, tc)
+        E[i] = (1/2) * km * m * (Ψ[1,3]^2 + Ψ[1,4]^2) + (1/2) * m * sum(Ψ[2:end,3].^2 .+ Ψ[2:end,4].^2)
 
+        t = event[1]
+        event = dequeue!(pq)
+
+        if E[i] < 0.1 * E[1]
+            it_stop = i
+            break
+        end
     end
 
-
+    display("Returned")
+    # Returnes the fraction of affected particles
+    return Ψ₀[:,1:2], Ψ[:,1:2], affected_amount(Ψ₀, Ψ, tol), pac
 end
 
+function scan_variable_v(tol, ncores)
+    tol = 0
+    r = 0.005
+    N = 3200
+    v = [5 * i^2 for i ∈ 5:1:15]
+    aps = Array{Float64, 1}(undef, Int(length(v)))
+    for i in 1:1:Int(length(v))
+        init_pos, final_pos, ap, pac = problem_4p(N, 0.5, r, 10, v[i], 5, 25, tol, 0, 100000, ncores)
+        aps[i] = ap
+    end
+    writedlm("craters_v.csv", aps, ',')
+    writedlm("craters_vv.csv", v, ',')
+end
+
+# For test B4
+#bs, θ = test_B4(100, ncores)
+#plot(bs, θ, yticks=([0 π/4 π/2 3*π/4 π], [L"0" L"\frac{\pi}{4}" L"\frac{\pi}{2}" L"\frac{3 \pi}{4}" L"\pi"]))
+#savefig("testB4.pdf")
+
+# For problem 1:
+#for i ∈ 1:1:20
+#    veli, velf = problem_1p(N, ξ, m, r, v0max, 1000000, ncores)
+#    fn = "final_velocities_parallel"*string(i)*".csv"
+#    writedlm(fn, velf, ',')
+#    fn = "initial_velocities_parallel"*string(i)*".csv"
+#    writedlm(fn, veli, ',')
+#end
+
+
+
+# For problem 3:
+#K1, K2, Kt, ti, it_stop = problem_3p(N, 0.8, 10, 0.001, v0max, 300000, ncores, 0)
+#plot([ti ti ti], [K1, K2, Kt])
+
+# For problem 4:
+#tol = 0
+#r = 0.005
+#N = 3200
+#init_pos, final_pos, ap, pac = problem_4p(N, 0.5, r, 10, 5, 5, 25, tol, 0, 100000, ncores)
+
+#display(ap)
+#display(pac)
+#plot(final_pos[1:1,1], final_pos[1:1,2], seriestype = :scatter, legend = false, size = (600, 600),
+#markersize = 5 * r * (1.101 * 550),  xlims=(0,1), ylims=(0,1))
+#plot!(final_pos[2:end,1], final_pos[2:end,2], seriestype = :scatter,
+#markersize = r * (1.101 * 550))
+
+#scan_variable_v(tol, ncores)
 
 #velsq = vel.^2
 #E = transpose(sum(velsq, dims=1))
