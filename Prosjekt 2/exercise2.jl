@@ -1,5 +1,6 @@
 using LinearAlgebra, Plots, Distributions
 using Distributed, SharedArrays, LaTeXStrings
+using ProgressMeter
 
 # Constants
 h = 0.01            # timestep
@@ -123,7 +124,7 @@ function solver(f, alg, params, h, T, t0, y0)
     y = Array{Float64, 3}(undef, length(y0[:,1]), length(y0[1,:]), N)
     y[:,:,1] = y0
 
-    for n in 2:1:N
+    @showprogress 1 "Computing..." for n in 2:1:N
         y[:,:,n] = alg(f, h, y[:,:,n-1], t[n-1], params)
     end
     return y, t
@@ -155,7 +156,7 @@ function make_animation_mult_spins(y, nl)
         projection="3d", xlims=(-2, length(y[1,:,1]) + 2), ylims=(-2,2), zlims=(-2,2),
         arrow=:filled)
     end
-    gif(anim, "TenSpins.gif", fps=30)
+    gif(anim, "TenSpinsFerromagneticDamped.gif", fps=30)
 end
 
 
@@ -167,15 +168,6 @@ function Analytic_spin_precession(t, S0, θ, γ, B)
     St[3,:] = S0 * cos(θ) .* ones(length(t))
     return St
 end
-
-
-# Finding the error for between the analytic solution of the spin precession
-# and the simulated one.
-function estimate_error_with_analytic(yS, yA, T, tend)
-    nend = Int(trunc(length(yA[1,:]) * tend / T))
-    return norm(yA[:,nend] .- yS[:,nend])
-end
-
 
 
 # These are the main functions for the project
@@ -198,6 +190,8 @@ function plot_spin_precession(S0, φ, θ, params, T)
     y, t = solver(LLG_equation, Heun_algorithm, params, 0.01, T, 0, y0)
     tt = [t t]
     yy = [y[1,1,:] y[2,1,:]]
+    S_length = sqrt.(y[1,1,:].^2 .+ y[2,1,:].^2 .+ y[3,1,:].^2)
+    display(S_length[end] - S_length[1])
     plot(tt, yy, label=[L"S_x (t)" L"S_y (t)"], title=L"\textrm{Single spin precession}",
     ylims=(-1,1))
     xlabel!(L"\gamma B_0  t \; [-]")
@@ -209,13 +203,17 @@ function plot_spin_with_analytic_solution(S0, φ, θ, params, T)
     y0 = initialize_spins_sd(S0, φ, θ, 1)
     y, t = solver(LLG_equation, Heun_algorithm, params, 0.01, T, 0, y0)
     yA = Analytic_spin_precession(t, S0, θ, params[2], params[8])
-    yy1 = [y[1,1,:] y[2,1,:]]
-    yy2 = [yA[1,:] yA[2,:]]
+    yy1 = [y[1,1,:] y[2,1,:] yA[1,:] yA[2,:]]
+    yy2 = [yA[1,:]-y[1,1,:] yA[2,:]-y[2,1,:]]
+    tttt = [t t t t]
     tt = [t t]
 
-    p1 = plot(tt, yy1, title=L"\textrm{Numerical}")
-    p2 = plot(tt, yy2, title=L"\textrm{Analytic}")
-    p3 = plot(p1, p2, layout = (2,1), ylims=(-1,1), label = [L"S_x(t)" L"S_y(t)"])
+    p1 = plot(tttt, yy1, title=L"\textrm{Numerical and analytical}",
+    label=[L"S_{xN}(t)" L"S_{yN}(t)" L"S_{xA}(t)" L"S_{yA}(t)"],
+    ylims=(-1,1))
+    p2 = plot(tt, yy2, title=L"\textrm{Difference in the components}",
+    label=[L"\Delta S_{x}(t)" L"\Delta S_{y}(t)"])
+    p3 = plot(p1, p2, layout = (2,1), legend=:outerright)
     xlabel!(L"\gamma B_0  t \; [-]")
     ylabel!(L"S_0 \frac{2}{\hbar} \; [-]")
     savefig(p3, "SpinWithAnalyticSolution.pdf")
@@ -245,15 +243,15 @@ function error_analysis_single_spin(S0, φ, θ, params, T, tend)
         ySH, t = solver(LLG_equation, Heun_algorithm, params, hs[i], T, 0, y0)
         ySE, t = solver(LLG_equation, Euler_algorithm, params, hs[i], T, 0, y0)
         yA = Analytic_spin_precession(t, S0, θ, γ, params[8])
-        errors[i, 1] = estimate_error_with_analytic(ySH[:,1,:], yA, T, tend)
-        errors[i, 2] = estimate_error_with_analytic(ySE[:,1,:], yA, T, tend)
+        errors[i, 1] = abs(ySH[1,1,end] - yA[1,end])
+        errors[i, 2] = abs(ySE[1,1,end] - yA[1,end])
     end
     hss = [hs hs]
 
     scatter(hs, errors, shape=:x, xaxis=:log, yaxis=:log, label=[L"\textrm{Heun}" L"\textrm{Euler}"],
     title=L"\textrm{Error as a function of timestep}", legend=:topleft)
-    xlabel!(L"h \; [\textrm{s}]")
-    ylabel!(L"\Delta S \; [\textrm{N} \textrm{m}^2 \textrm{/ s}]")
+    xlabel!(L"\gamma B_0 h \; [\textrm{s}]")
+    ylabel!(L"\Delta S_x / S_0 \; [-]")
     savefig("ErrorComparison.pdf")
 end
 
@@ -348,8 +346,8 @@ params = append!(params, [0 0 0])
 #plot_random_spins(S0, params, T, h)
 
 # This function simulates and plots the x-component of 10 spins precessing
-params = [0.05, γ, μ, 0.1, 0.1]
+params = [0.05, γ, μ, 1, 0.1]
 params = append!(params, [0 0 0])
 
-#animate_spins_sdo(S0, φ, θ, params, T, h, 40, 100)
+#animate_spins_sdo(S0, φ, θ, params, T, h, 20, 10)
 #plot_spins_sdo(S0, φ, θ, params, T, h)

@@ -754,7 +754,7 @@ function problem_3p(N, ξ, m, r, v0max, it, ncores, tc, eng_maxcpp = false, maxc
     event = dequeue!(pq)
     coll = 0
     collpp = 0
-    it_stop = 0
+    it_stop = it
 
     @showprogress 1 "Computing..." for i ∈ 2:it
         Δt = event[1] - t
@@ -796,7 +796,7 @@ function problem_4p(N, ξ, r, m, v0, kr, km, tol, tc, it, ncores)
     event = dequeue!(pq)
     coll = 0
     collpp = 0
-    it_stop = 0
+    it_stop = it
 
     @showprogress 1 "Computing..." for i ∈ 2:it
         Δt = event[1] - t
@@ -814,23 +814,24 @@ function problem_4p(N, ξ, r, m, v0, kr, km, tol, tc, it, ncores)
         end
     end
 
-    display("Returned")
+    display("Returned with "*string(it_stop)*" iterations")
     # Returnes the fraction of affected particles
-    return Ψ₀[:,1:2], Ψ[:,1:2], affected_amount(Ψ₀, Ψ, tol), pac
+    return Ψ₀[:,1:2], Ψ[:,1:2], affected_amount(Ψ₀, Ψ, tol), pac, it_stop
 end
 
 function scan_variable_v(tol, ncores)
     tol = 0
-    r = 0.005
-    N = 3200
-    v = [5 * i^2 for i ∈ 5:1:15]
+    r = 0.007
+    N = 1650
+    v = [10 * i for i ∈ 1:1:10]
+    display(v)
     aps = Array{Float64, 1}(undef, Int(length(v)))
     for i in 1:1:Int(length(v))
-        init_pos, final_pos, ap, pac = problem_4p(N, 0.5, r, 10, v[i], 5, 25, tol, 0, 100000, ncores)
+        init_pos, final_pos, ap, pac, its = problem_4p(N, 0.5, r, 10, v[i], 5, 25, tol, 0, 10000000, ncores)
         aps[i] = ap
     end
-    writedlm("craters_v.csv", aps, ',')
-    writedlm("craters_vv.csv", v, ',')
+    writedlm("craters_v2.csv", aps, ',')
+    writedlm("craters_vv2.csv", v, ',')
 end
 
 # For test B4
@@ -838,35 +839,63 @@ end
 #plot(bs, θ, yticks=([0 π/4 π/2 3*π/4 π], [L"0" L"\frac{\pi}{4}" L"\frac{\pi}{2}" L"\frac{3 \pi}{4}" L"\pi"]))
 #savefig("testB4.pdf")
 
-# For problem 1:
-#for i ∈ 1:1:20
-#    veli, velf = problem_1p(N, ξ, m, r, v0max, 1000000, ncores)
-#    fn = "final_velocities_parallel"*string(i)*".csv"
-#    writedlm(fn, velf, ',')
-#    fn = "initial_velocities_parallel"*string(i)*".csv"
-#    writedlm(fn, veli, ',')
-#end
 
+# Solving the problems in the exercise:
+
+# For problem 1:
+prob1 = true
+if prob1
+    for i ∈ 1:1:1
+        veli, velf = problem_1p(N, ξ, m, r, v0max, 100000, ncores)
+        fn = "final_velocities_parallel"*string(i)*".csv"
+        display(veli)
+        #writedlm(fn, velf, ',')
+        fn = "initial_velocities_parallel"*string(i)*".csv"
+        #writedlm(fn, veli, ',')
+    end
+end
+
+
+# For problem 2:
+prob2 = false
+if prob2
+    v1, v2, av1, av2, k1, k2, t = problem_2p(20000, ξ, 10, 0.001, v0max, 1000000, ncores)
+end
 
 
 # For problem 3:
-#K1, K2, Kt, ti, it_stop = problem_3p(N, 0.8, 10, 0.001, v0max, 300000, ncores, 0)
-#plot([ti ti ti], [K1, K2, Kt])
+prob3 = false
+if prob3
+    K1, K2, Kt, ti, it_stop = problem_3p(N, 0.8, 10, 0.001, v0max, 1000000, ncores, 0, true, 10)
+
+    plot([ti[1:it_stop] ti[1:it_stop] ti[1:it_stop]],
+    [K1[1:it_stop], K2[1:it_stop], Kt[1:it_stop]],
+    title=L"\textrm{Average kinetic energy,} \; \xi = 0.8",
+    label=[L"m = m_0" L"m = 4 m_0" L"\textrm{Total}"])
+    xlabel!(L"t \; \; [\textrm{s}]")
+    ylabel!(L"K \; \; [\textrm{J}]")
+    savefig("problem34.pdf")
+end
+
 
 # For problem 4:
-#tol = 0
-#r = 0.005
-#N = 3200
-#init_pos, final_pos, ap, pac = problem_4p(N, 0.5, r, 10, 5, 5, 25, tol, 0, 100000, ncores)
+prob4 = false
+if prob4
+    tol = 0
+    r = 0.007
+    N = 1650
+    init_pos, final_pos, ap, pac, its = problem_4p(N, 0.5, r, 10, 5, 5, 25, tol, 0, 10000000, ncores)
 
-#display(ap)
-#display(pac)
-#plot(final_pos[1:1,1], final_pos[1:1,2], seriestype = :scatter, legend = false, size = (600, 600),
-#markersize = 5 * r * (1.101 * 550),  xlims=(0,1), ylims=(0,1))
-#plot!(final_pos[2:end,1], final_pos[2:end,2], seriestype = :scatter,
-#markersize = r * (1.101 * 550))
+    display(string(ap)*" crater size")
+    display("The packing fraction is "*string(pac))
+    display("The number of iterations before stop: "*string(its))
+    plot(final_pos[1:1,1], final_pos[1:1,2], seriestype = :scatter, legend = false, size = (600, 600),
+    markersize = 5 * r * (1.101 * 550),  xlims=(0,1), ylims=(0,1))
+    plot!(final_pos[2:end,1], final_pos[2:end,2], seriestype = :scatter,
+    markersize = r * (1.101 * 550))
 
-#scan_variable_v(tol, ncores)
+    scan_variable_v(tol, ncores)
+end
 
 #velsq = vel.^2
 #E = transpose(sum(velsq, dims=1))
